@@ -1,0 +1,6 @@
+{
+  "name": "SecureVault",
+  "description": "A secure, local-first, zero-knowledge password manager and cryptographic vault documentation.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

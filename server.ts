@@ -43,6 +43,11 @@ interface Setting {
   autoLockTime: number; // in minutes
   requirePasswordOnCopy: boolean;
   twoFactorEnabled: boolean;
+  requirePasswordOnAction?: boolean;
+  autoClearClipboardTime?: number; // in seconds
+  maxFailedAttempts?: number;
+  lockOnBrowserClose?: boolean;
+  rememberTrustedDevice?: boolean;
 }
 
 interface Backup {
@@ -108,7 +113,12 @@ app.post("/api/auth/register", (req, res) => {
     username,
     autoLockTime: 15,
     requirePasswordOnCopy: false,
-    twoFactorEnabled: false
+    twoFactorEnabled: false,
+    requirePasswordOnAction: true,
+    autoClearClipboardTime: 30,
+    maxFailedAttempts: 5,
+    lockOnBrowserClose: true,
+    rememberTrustedDevice: false
   });
 
   // Log action
@@ -418,10 +428,22 @@ app.get("/api/settings", (req, res) => {
       username,
       autoLockTime: 15,
       requirePasswordOnCopy: false,
-      twoFactorEnabled: false
+      twoFactorEnabled: false,
+      requirePasswordOnAction: true,
+      autoClearClipboardTime: 30,
+      maxFailedAttempts: 5,
+      lockOnBrowserClose: true,
+      rememberTrustedDevice: false
     };
     db.settings.push(userSettings);
     saveDB(db);
+  } else {
+    // Fill in default values if undefined
+    if (userSettings.requirePasswordOnAction === undefined) userSettings.requirePasswordOnAction = true;
+    if (userSettings.autoClearClipboardTime === undefined) userSettings.autoClearClipboardTime = 30;
+    if (userSettings.maxFailedAttempts === undefined) userSettings.maxFailedAttempts = 5;
+    if (userSettings.lockOnBrowserClose === undefined) userSettings.lockOnBrowserClose = true;
+    if (userSettings.rememberTrustedDevice === undefined) userSettings.rememberTrustedDevice = false;
   }
   res.status(200).json(userSettings);
 });
@@ -431,23 +453,42 @@ app.post("/api/settings/update", (req, res) => {
   if (!username) {
     return res.status(401).json({ error: "User authentication required" });
   }
-  const { autoLockTime, requirePasswordOnCopy, twoFactorEnabled } = req.body;
+  const { 
+    autoLockTime, 
+    requirePasswordOnCopy, 
+    twoFactorEnabled,
+    requirePasswordOnAction,
+    autoClearClipboardTime,
+    maxFailedAttempts,
+    lockOnBrowserClose,
+    rememberTrustedDevice
+  } = req.body;
 
   const db = loadDB();
   const index = db.settings.findIndex(s => s.username.toLowerCase() === username.toLowerCase());
   if (index === -1) {
     db.settings.push({
       username,
-      autoLockTime: Number(autoLockTime) || 15,
+      autoLockTime: autoLockTime !== undefined ? Number(autoLockTime) : 15,
       requirePasswordOnCopy: !!requirePasswordOnCopy,
-      twoFactorEnabled: !!twoFactorEnabled
+      twoFactorEnabled: !!twoFactorEnabled,
+      requirePasswordOnAction: requirePasswordOnAction !== undefined ? !!requirePasswordOnAction : true,
+      autoClearClipboardTime: autoClearClipboardTime !== undefined ? Number(autoClearClipboardTime) : 30,
+      maxFailedAttempts: maxFailedAttempts !== undefined ? Number(maxFailedAttempts) : 5,
+      lockOnBrowserClose: lockOnBrowserClose !== undefined ? !!lockOnBrowserClose : true,
+      rememberTrustedDevice: !!rememberTrustedDevice
     });
   } else {
     db.settings[index] = {
       username,
       autoLockTime: autoLockTime !== undefined ? Number(autoLockTime) : db.settings[index].autoLockTime,
       requirePasswordOnCopy: requirePasswordOnCopy !== undefined ? !!requirePasswordOnCopy : db.settings[index].requirePasswordOnCopy,
-      twoFactorEnabled: twoFactorEnabled !== undefined ? !!twoFactorEnabled : db.settings[index].twoFactorEnabled
+      twoFactorEnabled: twoFactorEnabled !== undefined ? !!twoFactorEnabled : db.settings[index].twoFactorEnabled,
+      requirePasswordOnAction: requirePasswordOnAction !== undefined ? !!requirePasswordOnAction : (db.settings[index].requirePasswordOnAction ?? true),
+      autoClearClipboardTime: autoClearClipboardTime !== undefined ? Number(autoClearClipboardTime) : (db.settings[index].autoClearClipboardTime ?? 30),
+      maxFailedAttempts: maxFailedAttempts !== undefined ? Number(maxFailedAttempts) : (db.settings[index].maxFailedAttempts ?? 5),
+      lockOnBrowserClose: lockOnBrowserClose !== undefined ? !!lockOnBrowserClose : (db.settings[index].lockOnBrowserClose ?? true),
+      rememberTrustedDevice: rememberTrustedDevice !== undefined ? !!rememberTrustedDevice : (db.settings[index].rememberTrustedDevice ?? false)
     };
   }
 

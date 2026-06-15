@@ -79,6 +79,18 @@ export default function AuthScreen({ onAuthenticated }: AuthScreenProps) {
       return;
     }
 
+    const trimmedUsername = username.trim().toLowerCase();
+    const lockoutKey = `securevault_lockout_${trimmedUsername}`;
+    const failedKey = `securevault_failed_${trimmedUsername}`;
+    
+    // Check if locked out
+    const lockoutTime = localStorage.getItem(lockoutKey);
+    if (lockoutTime && Number(lockoutTime) > Date.now()) {
+      const remainingSeconds = Math.ceil((Number(lockoutTime) - Date.now()) / 1000);
+      setErrorMsg(`Brute-force protection: Too many failed attempts. Try again in ${remainingSeconds} seconds.`);
+      return;
+    }
+
     setIsLoading(true);
     setErrorMsg("");
     setSuccessMsg("");
@@ -111,11 +123,43 @@ export default function AuthScreen({ onAuthenticated }: AuthScreenProps) {
         throw new Error(data.error || "Authentication failed.");
       }
 
+      // Clear successful attempts
+      localStorage.removeItem(failedKey);
+      localStorage.removeItem(lockoutKey);
+
       // Successful auth! Hand over to core application state in memory.
       onAuthenticated(data.username, encryptionKey);
     } catch (err: any) {
       console.error(err);
-      setErrorMsg(err.message || "Failed to authenticate signal. Check master passphrases.");
+      
+      // Track failed attempt
+      let maxAttempts = 5; // Default recommendation
+      try {
+        const savedSettingsStr = localStorage.getItem(`securevault_settings_${trimmedUsername}`);
+        if (savedSettingsStr) {
+          const parsed = JSON.parse(savedSettingsStr);
+          if (parsed.maxFailedAttempts !== undefined) maxAttempts = parsed.maxFailedAttempts;
+        }
+      } catch (err) {
+        console.error("Error reading pre-saved user settings for lock limits: ", err);
+      }
+
+      if (maxAttempts > 0) {
+        let failedCount = Number(localStorage.getItem(failedKey) || "0") + 1;
+        localStorage.setItem(failedKey, failedCount.toString());
+
+        if (failedCount >= maxAttempts) {
+          const lockDuration = 5 * 60 * 1000; // 5 minute lock
+          const lockedUntil = Date.now() + lockDuration;
+          localStorage.setItem(lockoutKey, lockedUntil.toString());
+          localStorage.setItem(failedKey, "0"); // Reset count
+          setErrorMsg(`Brute-force protection activated: Limit of ${maxAttempts} failed attempts reached. You are locked out for 5 minutes.`);
+        } else {
+          setErrorMsg(`${err.message || "Failed to authenticate signal. Check master passphrases."} (Failed attempts: ${failedCount}/${maxAttempts})`);
+        }
+      } else {
+        setErrorMsg(err.message || "Failed to authenticate signal. Check master passphrases.");
+      }
     } finally {
       setIsLoading(false);
     }

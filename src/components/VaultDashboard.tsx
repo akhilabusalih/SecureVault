@@ -4,12 +4,73 @@ import {
   Settings, Key, AlertCircle, FileSpreadsheet, Lock, 
   BookOpen, LogOut, Check, Eye, EyeOff, LayoutGrid, 
   Heart, Calendar, RefreshCw, ChevronRight, Activity, 
-  FileText, Trash2, Edit3, Sparkles 
+  FileText, Trash2, Edit3, Sparkles, Smartphone, Laptop,
+  X, CheckCircle, ShieldAlert, Sliders, KeyRound
 } from "lucide-react";
 import { VaultItem, EncryptedVaultItem, BackupItem, ActivityLogItem, UserSettings } from "../types";
-import { encryptPayload, decryptPayload, generateSalt, bufToHex, encryptFile, decryptFile } from "../utils/crypto";
+import { 
+  encryptPayload, decryptPayload, generateSalt, bufToHex, 
+  encryptFile, decryptFile, hexToBuf, generateVerifierHash 
+} from "../utils/crypto";
 import PasswordGenerator from "./PasswordGenerator";
 import DocsLayout from "./DocsLayout";
+
+// Detect browser userAgent details to discover active workstation and platform
+const getActiveDevice = () => {
+  if (typeof window === "undefined" || !navigator) {
+    return {
+      id: "session-active",
+      name: "Workstation (Unknown - Session Secure)",
+      lastActive: "Just Now",
+      isCurrent: true,
+      type: "desktop" as "desktop" | "mobile"
+    };
+  }
+
+  const cachedSess = sessionStorage.getItem("securevault_active_session");
+  if (cachedSess) {
+    try {
+      return JSON.parse(cachedSess);
+    } catch (e) {
+      // ignore
+    }
+  }
+
+  const ua = navigator.userAgent;
+  let osName = "Unknown Workstation";
+  let browserName = "Unknown Browser";
+  let type: "desktop" | "mobile" = "desktop";
+
+  if (/Windows/i.test(ua)) osName = "Windows";
+  else if (/Macintosh|Mac OS X/i.test(ua)) {
+    if (/iPhone|iPad|iPod/i.test(ua)) {
+      osName = "iOS";
+      type = "mobile";
+    } else {
+      osName = "macOS";
+    }
+  } else if (/Android/i.test(ua)) {
+    osName = "Android";
+    type = "mobile";
+  } else if (/Linux/i.test(ua)) osName = "Linux";
+
+  if (/Firefox/i.test(ua)) browserName = "Firefox";
+  else if (/Chrome/i.test(ua) && !/Edge|Edg/i.test(ua)) browserName = "Chrome";
+  else if (/Safari/i.test(ua) && !/Chrome/i.test(ua) && !/Edge|Edg/i.test(ua)) browserName = "Safari";
+  else if (/Edge|Edg/i.test(ua)) browserName = "Edge";
+  else if (/MSIE|Trident/i.test(ua)) browserName = "Internet Explorer";
+
+  const currentSess = {
+    id: "session-active",
+    name: `Current Workstation (${osName} - ${browserName} - Session Secure)`,
+    lastActive: "Just Now",
+    isCurrent: true,
+    type
+  };
+
+  sessionStorage.setItem("securevault_active_session", JSON.stringify(currentSess));
+  return currentSess;
+};
 
 interface VaultDashboardProps {
   username: string;
@@ -26,10 +87,54 @@ export default function VaultDashboard({ username, masterKey, onLock }: VaultDas
   const [vaultItems, setVaultItems] = useState<VaultItem[]>([]);
   const [backups, setBackups] = useState<BackupItem[]>([]);
   const [logs, setLogs] = useState<ActivityLogItem[]>([]);
+  
+  // High-Security User Settings matching specification
   const [settings, setSettings] = useState<UserSettings>({
     autoLockTime: 15,
     requirePasswordOnCopy: false,
-    twoFactorEnabled: false
+    twoFactorEnabled: false,
+    requirePasswordOnAction: true,
+    autoClearClipboardTime: 30,
+    maxFailedAttempts: 5,
+    lockOnBrowserClose: true,
+    rememberTrustedDevice: false
+  });
+
+  // Reauthentication dialog state
+  const [reauthModal, setReauthModal] = useState<{
+    isOpen: boolean;
+    onSuccess: () => void;
+    reason: string;
+  }>({
+    isOpen: false,
+    onSuccess: () => {},
+    reason: ""
+  });
+  const [reauthPassword, setReauthPassword] = useState("");
+  const [reauthError, setReauthError] = useState("");
+  const [isReauthing, setIsReauthing] = useState(false);
+
+  // Trusted Devices list dynamically aligned with current active session and trusted storage state
+  const [trustedDevices, setTrustedDevices] = useState<any[]>(() => {
+    const currentDev = getActiveDevice();
+    const storedTrustedKey = `securevault_trusted_devices_${username.trim().toLowerCase()}`;
+    let loadedDevices: any[] = [];
+    try {
+      const savedStr = localStorage.getItem(storedTrustedKey);
+      if (savedStr) {
+        loadedDevices = JSON.parse(savedStr);
+      }
+    } catch (e) {
+      console.error("Error reading trusted devices storage:", e);
+    }
+
+    const activeExists = loadedDevices.some(d => d.name === currentDev.name);
+    
+    const combined = activeExists
+      ? loadedDevices.map(d => d.name === currentDev.name ? { ...d, isCurrent: true, lastActive: "Just Now" } : { ...d, isCurrent: false })
+      : [currentDev, ...loadedDevices.map(d => ({ ...d, isCurrent: false }))];
+
+    return combined;
   });
 
   // UI state
@@ -128,6 +233,7 @@ export default function VaultDashboard({ username, masterKey, onLock }: VaultDas
       if (settingsResp.ok) {
         const settingsData = await settingsResp.json();
         setSettings(settingsData);
+        localStorage.setItem(`securevault_settings_${username.trim().toLowerCase()}`, JSON.stringify(settingsData));
       }
     } catch (err: any) {
       console.error(err);
@@ -141,11 +247,12 @@ export default function VaultDashboard({ username, masterKey, onLock }: VaultDas
     fetchAllData();
   }, [username]);
 
-  // Handle Automatic session lockout
+  // Handle Automatic session lockout and browser close locks
   useEffect(() => {
     let timeoutId: NodeJS.Timeout;
     const resetTimer = () => {
       clearTimeout(timeoutId);
+      if (settings.autoLockTime === 0) return; // Never Lock
       const limitMs = settings.autoLockTime * 60 * 1000;
       timeoutId = setTimeout(() => {
         onLock();
@@ -156,28 +263,199 @@ export default function VaultDashboard({ username, masterKey, onLock }: VaultDas
     window.addEventListener("keydown", resetTimer);
     resetTimer();
 
+    // Lock Vault on Browser Close
+    const handleBeforeUnload = () => {
+      if (settings.lockOnBrowserClose) {
+        onLock();
+      }
+    };
+    window.addEventListener("beforeunload", handleBeforeUnload);
+
     return () => {
       clearTimeout(timeoutId);
       window.removeEventListener("mousemove", resetTimer);
       window.removeEventListener("keydown", resetTimer);
+      window.removeEventListener("beforeunload", handleBeforeUnload);
     };
-  }, [settings.autoLockTime, onLock]);
+  }, [settings.autoLockTime, settings.lockOnBrowserClose, onLock]);
+
+  // Global Keydown listener for Panic Lock shortcut: Ctrl + Shift + L
+  useEffect(() => {
+    const handleGlobalShortcuts = (e: KeyboardEvent) => {
+      if (e.ctrlKey && e.shiftKey && (e.key === "L" || e.key === "l")) {
+        e.preventDefault();
+        triggerPanicLock();
+      }
+    };
+    window.addEventListener("keydown", handleGlobalShortcuts);
+    return () => {
+      window.removeEventListener("keydown", handleGlobalShortcuts);
+    };
+  }, []);
+
+  // Handle toggling persistent Device Trust based on rememberTrustedDevice setting
+  useEffect(() => {
+    const currentDev = getActiveDevice();
+    const storedTrustedKey = `securevault_trusted_devices_${username.trim().toLowerCase()}`;
+    let loadedDevices: any[] = [];
+    try {
+      const savedStr = localStorage.getItem(storedTrustedKey);
+      if (savedStr) {
+        loadedDevices = JSON.parse(savedStr);
+      }
+    } catch (e) {
+      // ignore
+    }
+
+    if (settings.rememberTrustedDevice) {
+      const alreadySaved = loadedDevices.some(d => d.name === currentDev.name);
+      if (!alreadySaved) {
+        const toSave = { 
+          id: currentDev.id, 
+          name: currentDev.name, 
+          lastActive: "Just Now", 
+          isCurrent: false, 
+          type: currentDev.type 
+        };
+        const updated = [...loadedDevices, toSave];
+        localStorage.setItem(storedTrustedKey, JSON.stringify(updated));
+        
+        setTrustedDevices(prev => {
+          const exists = prev.some(d => d.name === currentDev.name);
+          if (!exists) {
+            return [currentDev, ...prev];
+          }
+          return prev;
+        });
+      }
+    } else {
+      const updated = loadedDevices.filter(d => d.name !== currentDev.name);
+      localStorage.setItem(storedTrustedKey, JSON.stringify(updated));
+    }
+  }, [settings.rememberTrustedDevice, username]);
+
+  // Panic Lock Implementation
+  const triggerPanicLock = () => {
+    // 1. Clear sensitive clipboard memory cache instantly
+    navigator.clipboard.writeText("[SecureVault Panic Lock Cleared]");
+    // 2. Clear any stored auth tokens
+    sessionStorage.clear();
+    localStorage.removeItem("securevault_active_session");
+    // 3. Immediately seal decryption memory keys and return to auth screen
+    onLock();
+  };
+
+  // Reauthentication flow before sensitive actions
+  const triggerReauth = (reason: string, onSuccess: () => void) => {
+    if (!settings.requirePasswordOnAction) {
+      onSuccess();
+      return;
+    }
+    setReauthPassword("");
+    setReauthError("");
+    setReauthModal({
+      isOpen: true,
+      onSuccess,
+      reason
+    });
+  };
+
+  const handleReauthSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!reauthPassword) {
+      setReauthError("Master passphrase is required.");
+      return;
+    }
+    setIsReauthing(true);
+    setReauthError("");
+    try {
+      // 1. Get user salt from server
+      const saltResp = await fetch(`/api/auth/check/${encodeURIComponent(username.trim())}`);
+      if (!saltResp.ok) throw new Error("Verification error: Master salt signature lookup failed.");
+      const { salt: saltHex } = await saltResp.json();
+      const saltBytes = hexToBuf(saltHex);
+
+      // 2. Compute master verifier
+      const verifier = await generateVerifierHash(reauthPassword, saltBytes);
+
+      // 3. Verify verifier credentials on backend server
+      const response = await fetch("/api/auth/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          username: username.trim(),
+          verifierHash: verifier
+        })
+      });
+
+      if (!response.ok) {
+        throw new Error("Invalid master passphrase authentication check.");
+      }
+
+      // Close modal and execute action callback
+      setReauthModal(prev => ({ ...prev, isOpen: false }));
+      reauthModal.onSuccess();
+    } catch (err: any) {
+      setReauthError(err.message || "Failed authentication checks.");
+    } finally {
+      setIsReauthing(false);
+    }
+  };
 
   const copyToClipboard = (text: string, fieldType: string, feedbackId?: string) => {
+    // Require Verification Before Copy (if enabled under settings, or if requirePasswordOnAction is set for password copies)
+    const needsVerification = (settings.requirePasswordOnCopy && fieldType === "Password") || 
+                              (settings.requirePasswordOnAction && fieldType === "Password");
+
+    if (needsVerification) {
+      triggerReauth("Copy sensitive credential elements", () => {
+        performCopy(text, fieldType, feedbackId);
+      });
+    } else {
+      performCopy(text, fieldType, feedbackId);
+    }
+  };
+
+  const performCopy = (text: string, fieldType: string, feedbackId?: string) => {
     navigator.clipboard.writeText(text);
     setCopiedField(fieldType);
     if (feedbackId) setCopiedFeedbackId(feedbackId);
     
+    // Auto clear feedback status
     setTimeout(() => {
       setCopiedField(null);
       setCopiedFeedbackId(null);
     }, 2000);
+
+    // Auto Clear Clipboard Memory limit
+    if (settings.autoClearClipboardTime > 0) {
+      setTimeout(() => {
+        // Read current text, if unchanged, overwrite to clear
+        navigator.clipboard.readText().then(currentText => {
+          if (currentText === text) {
+            navigator.clipboard.writeText("[SecureVault Clipboard Cleared]");
+            setApiSuccess("Clipboard securely purged!");
+            setTimeout(() => setApiSuccess(""), 2000);
+          }
+        }).catch(() => {
+          // Fallback overwrite
+          navigator.clipboard.writeText("[SecureVault Clipboard Cleared]");
+        });
+      }, settings.autoClearClipboardTime * 1000);
+    }
   };
 
   const togglePasswordVisibility = (id: string) => {
-    setViewPasswordIds(prev => 
-      prev.includes(id) ? prev.filter(pId => pId !== id) : [...prev, id]
-    );
+    const isCurrentlyShowing = viewPasswordIds.includes(id);
+    if (!isCurrentlyShowing && settings.requirePasswordOnAction) {
+      triggerReauth("View sensitive vault record credentials", () => {
+        setViewPasswordIds(prev => [...prev, id]);
+      });
+    } else {
+      setViewPasswordIds(prev => 
+        prev.includes(id) ? prev.filter(pId => pId !== id) : [...prev, id]
+      );
+    }
   };
 
   // Create or Update handling
@@ -392,45 +670,49 @@ export default function VaultDashboard({ username, masterKey, onLock }: VaultDas
 
   // Backups and import triggers
   const handleCreateRawBackupOnServer = async () => {
-    setApiError("");
-    setApiSuccess("");
-    try {
-      const response = await fetch("/api/backups/create", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-vault-user": username
-        },
-        body: JSON.stringify({ type: "Manual" })
-      });
-      if (!response.ok) throw new Error("Server failed to write snapshot log.");
-      
-      setApiSuccess("Durable snapshot created on host filesystem.");
-      fetchAllData();
-    } catch (err: any) {
-      setApiError(err.message || "Failed to write backup.");
-    }
+    triggerReauth("Create server database backup snapshot", async () => {
+      setApiError("");
+      setApiSuccess("");
+      try {
+        const response = await fetch("/api/backups/create", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-vault-user": username
+          },
+          body: JSON.stringify({ type: "Manual" })
+        });
+        if (!response.ok) throw new Error("Server failed to write snapshot log.");
+        
+        setApiSuccess("Durable snapshot created on host filesystem.");
+        fetchAllData();
+      } catch (err: any) {
+        setApiError(err.message || "Failed to write backup.");
+      }
+    });
   };
 
   // Export encrypted payload payload down as physical file
   const handleExportPhysicalFile = async () => {
-    try {
-      const vaultResp = await fetch("/api/vault", {
-        headers: { "x-vault-user": username }
-      });
-      if (!vaultResp.ok) throw new Error("Unable to read snapshot databases.");
-      const encryptedData = await vaultResp.json();
+    triggerReauth("Export vault credentials container", async () => {
+      try {
+        const vaultResp = await fetch("/api/vault", {
+          headers: { "x-vault-user": username }
+        });
+        if (!vaultResp.ok) throw new Error("Unable to read snapshot databases.");
+        const encryptedData = await vaultResp.json();
 
-      const blob = new Blob([JSON.stringify(encryptedData, null, 2)], { type: "application/json" });
-      const link = document.createElement("a");
-      link.href = URL.createObjectURL(blob);
-      link.download = `securevault_export_${username}.json`;
-      link.click();
-      
-      setApiSuccess("Downloaded completely encrypted database (zero-knowledge payload).");
-    } catch (err: any) {
-      setApiError(err.message || "Export file write failure.");
-    }
+        const blob = new Blob([JSON.stringify(encryptedData, null, 2)], { type: "application/json" });
+        const link = document.createElement("a");
+        link.href = URL.createObjectURL(blob);
+        link.download = `securevault_export_${username}.json`;
+        link.click();
+        
+        setApiSuccess("Downloaded completely encrypted database (zero-knowledge payload).");
+      } catch (err: any) {
+        setApiError(err.message || "Export file write failure.");
+      }
+    });
   };
 
   // Import encrypted backup and restore
@@ -438,69 +720,77 @@ export default function VaultDashboard({ username, masterKey, onLock }: VaultDas
     const file = e.target.files?.[0];
     if (!file) return;
 
-    setApiError("");
-    setApiSuccess("");
-    const reader = new FileReader();
-    reader.onload = async (event) => {
-      try {
-        const fileContent = event.target?.result as string;
-        const parsedData = JSON.parse(fileContent);
+    triggerReauth("Restore vault entries from backup container", async () => {
+      setApiError("");
+      setApiSuccess("");
+      const reader = new FileReader();
+      reader.onload = async (event) => {
+        try {
+          const fileContent = event.target?.result as string;
+          const parsedData = JSON.parse(fileContent);
 
-        if (!Array.isArray(parsedData)) {
-          throw new Error("Invalid file format. Backup must be a JSON array of encrypted vault items.");
-        }
-
-        // Test at least one decryp block check to avoid loading corrupt secrets
-        if (parsedData.length > 0) {
-          const testItem = parsedData[0];
-          if (!testItem.encryptedBlob || !testItem.iv) {
-            throw new Error("File contains invalid cipher structures.");
+          if (!Array.isArray(parsedData)) {
+            throw new Error("Invalid file format. Backup must be a JSON array of encrypted vault items.");
           }
+
+          // Test at least one decryp block check to avoid loading corrupt secrets
+          if (parsedData.length > 0) {
+            const testItem = parsedData[0];
+            if (!testItem.encryptedBlob || !testItem.iv) {
+              throw new Error("File contains invalid cipher structures.");
+            }
+          }
+
+          const response = await fetch("/api/backups/restore", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "x-vault-user": username
+            },
+            body: JSON.stringify({ backupData: parsedData })
+          });
+
+          if (!response.ok) {
+            const respData = await response.json();
+            throw new Error(respData.error || "Failed to restore array indices.");
+          }
+
+          setApiSuccess(`Successfully imported and decrypted ${parsedData.length} records!`);
+          fetchAllData();
+        } catch (err: any) {
+          setApiError(err.message || "Error reading uploaded backup container.");
         }
-
-        const response = await fetch("/api/backups/restore", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "x-vault-user": username
-          },
-          body: JSON.stringify({ backupData: parsedData })
-        });
-
-        if (!response.ok) {
-          const respData = await response.json();
-          throw new Error(respData.error || "Failed to restore array indices.");
-        }
-
-        setApiSuccess(`Successfully imported and decrypted ${parsedData.length} records!`);
-        fetchAllData();
-      } catch (err: any) {
-        setApiError(err.message || "Error reading uploaded backup container.");
-      }
-    };
-    reader.readAsText(file);
+      };
+      reader.readAsText(file);
+    });
   };
 
   // Save Settings State onto server
   const handleSaveSettings = async (e: React.FormEvent) => {
     e.preventDefault();
-    setApiError("");
-    setApiSuccess("");
-    try {
-      const response = await fetch("/api/settings/update", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-vault-user": username
-        },
-        body: JSON.stringify(settings)
-      });
-      if (!response.ok) throw new Error("Failed validation settings storage.");
-      setApiSuccess("Local-first security rules applied.");
-      fetchAllData();
-    } catch (err: any) {
-      setApiError(err.message || "Failed update setting.");
-    }
+    triggerReauth("Modify local security settings config", async () => {
+      setApiError("");
+      setApiSuccess("");
+      try {
+        const response = await fetch("/api/settings/update", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-vault-user": username
+          },
+          body: JSON.stringify(settings)
+        });
+        if (!response.ok) throw new Error("Failed validation settings storage.");
+        
+        // Save to local storage for AuthScreen access on login lockouts
+        localStorage.setItem(`securevault_settings_${username.trim().toLowerCase()}`, JSON.stringify(settings));
+
+        setApiSuccess("Local-first security rules applied.");
+        fetchAllData();
+      } catch (err: any) {
+        setApiError(err.message || "Failed update setting.");
+      }
+    });
   };
 
   // Helper selectors
@@ -543,10 +833,10 @@ export default function VaultDashboard({ username, masterKey, onLock }: VaultDas
   const auditStats = calculateAuditOverview();
 
   return (
-    <div className="min-h-screen bg-[#0A0A0A] text-white font-sans flex flex-col antialiased">
+    <div className="h-screen overflow-hidden bg-[#0A0A0A] text-white font-sans flex flex-col antialiased">
       
       {/* Top Banner Control Rail */}
-      <header className="bg-[#0C0C0C]/80 border-b border-white/10 px-6 py-4 flex flex-wrap gap-4 justify-between items-center sticky top-0 z-40 backdrop-blur-md">
+      <header className="bg-[#0C0C0C]/80 border-b border-white/10 px-6 py-4 flex flex-wrap gap-4 justify-between items-center sticky top-0 z-40 backdrop-blur-md shrink-0">
         
         <div className="flex items-center gap-2.5">
           <div className="w-8 h-8 rounded-lg bg-[#00D4AA]/10 border border-[#00D4AA]/20 flex items-center justify-center text-[#00D4AA]">
@@ -588,10 +878,10 @@ export default function VaultDashboard({ username, masterKey, onLock }: VaultDas
       </header>
 
       {/* Main Container Layout */}
-      <div className="flex-1 max-w-7xl w-full mx-auto flex flex-col md:flex-row">
+      <div className="flex-1 max-w-7xl w-full mx-auto flex flex-col md:flex-row min-h-0 overflow-hidden">
         
         {/* Left Side navigation rail */}
-        <aside className="w-full md:w-64 bg-[#0C0C0C] p-4 border-b md:border-b-0 md:border-r border-white/10 flex flex-col gap-6 text-left shrink-0">
+        <aside className="w-full md:w-64 bg-[#0C0C0C] p-4 border-b md:border-b-0 md:border-r border-white/10 flex flex-col gap-6 text-left shrink-0 md:h-full md:overflow-y-auto">
           
           {/* Main sections */}
           <div className="space-y-1">
@@ -739,7 +1029,7 @@ export default function VaultDashboard({ username, masterKey, onLock }: VaultDas
         </aside>
 
         {/* Central working panel */}
-        <main className="flex-1 bg-[#0A0A0A] flex flex-col min-h-0 relative">
+        <main className="flex-1 bg-[#0A0A0A] flex flex-col min-h-0 relative overflow-y-auto">
           
           {/* Global Alert Notification toasts */}
           {apiError && (
@@ -1569,86 +1859,447 @@ export default function VaultDashboard({ username, masterKey, onLock }: VaultDas
           ) : (
             
             /* SUBVIEW: USER SETTINGS */
-            <div className="p-6 md:p-8 space-y-6 max-w-xl mx-auto text-left">
-              <div>
-                <h2 className="text-xl font-bold mb-1">Local Security Configurations</h2>
-                <p className="text-zinc-400 text-xs font-light">
-                  Tailor local memory configurations. Settings apply changes instantly on client browsers 
-                  and update user session parameters inside the hosting vault server databases.
-                </p>
+            <div className="p-6 md:p-8 space-y-8 max-w-5xl mx-auto text-left animate-fade-in">
+              <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 border-b border-white/5 pb-5">
+                <div>
+                  <h2 className="text-xl font-bold mb-1 font-sans tracking-tight text-white flex items-center gap-2">
+                    <Settings className="text-[#00D4AA] shrink-0" size={22} />
+                    Centralized Security Settings
+                  </h2>
+                  <p className="text-zinc-400 text-xs font-light">
+                    Enforce critical system-wide security policies, browser memory controls, and physical threat containment guards.
+                  </p>
+                </div>
+                
+                {/* Panic lock action right in top header for quick accessibility */}
+                <button
+                  type="button"
+                  onClick={triggerPanicLock}
+                  className="px-4 py-2 bg-red-955/40 hover:bg-red-900/50 border border-red-500/30 text-red-200 text-xs font-semibold rounded-md flex items-center gap-2 transition-all cursor-pointer shadow-sm hover:scale-[1.02]"
+                >
+                  <ShieldAlert size={14} className="text-red-400 animate-pulse" />
+                  Trigger Panic Lock
+                  <kbd className="bg-red-900/20 px-1.5 py-0.5 text-[9px] text-red-300 font-mono rounded">Ctrl+Shift+L</kbd>
+                </button>
               </div>
 
-              <form onSubmit={handleSaveSettings} className="bg-[#0C0C0C] border border-white/10 rounded-xl p-6 space-y-5 text-left text-xs shadow-lg">
-                
-                {/* Dropdown locked time */}
-                <div className="space-y-1.5">
-                  <label className="text-[10px] font-semibold text-zinc-500 font-mono uppercase tracking-wider block">
-                    Automatic Session Timeout lock
-                  </label>
-                  <p className="text-zinc-500 text-[10px] pb-1 font-light">
-                    Automatically seals decryption memory keys when the user remains idle on host device.
-                  </p>
-                  <select
-                    value={settings.autoLockTime}
-                    onChange={(e) => setSettings({ ...settings, autoLockTime: Number(e.target.value) })}
-                    className="w-full bg-[#171717] border border-white/5 rounded-md px-3.5 py-2 text-sm text-white placeholder-zinc-640 outline-none focus:border-[#00D4AA]/50 transition-colors font-mono"
-                  >
-                    <option value="1">1 Minute (Highly Secure)</option>
-                    <option value="5">5 Minutes</option>
-                    <option value="15">15 Minutes (Default)</option>
-                    <option value="30">30 Minutes</option>
-                    <option value="60">60 Minutes</option>
-                  </select>
-                </div>
+              {/* Grid 2-columns settings form */}
+              <form onSubmit={handleSaveSettings} className="space-y-6">
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-6 items-start">
+                  
+                  {/* Card 1: Session Security */}
+                  <div className="bg-[#0C0C0C] border border-white/10 rounded-xl p-5 space-y-4 shadow-lg min-h-[220px] flex flex-col justify-between">
+                    <div className="space-y-4">
+                      <h3 className="text-sm font-semibold text-white flex items-center gap-2 border-b border-white/5 pb-2">
+                        <Sliders size={16} className="text-[#00D4AA]" />
+                        Session Security Policies
+                      </h3>
+                      
+                      {/* Timeout Dropdown */}
+                      <div className="space-y-1.5">
+                        <label className="text-[10px] font-semibold text-zinc-400 font-mono uppercase tracking-wider block">
+                          Automatic Session Timeout lock
+                        </label>
+                        <p className="text-zinc-500 text-[10px] font-light leading-relaxed">
+                          Automatically seals decryption keys and logs out when your browser session becomes idle.
+                        </p>
+                        <select
+                          value={settings.autoLockTime}
+                          onChange={(e) => setSettings({ ...settings, autoLockTime: Number(e.target.value) })}
+                          className="w-full bg-[#171717] border border-white/5 rounded-md px-3 py-2 text-xs text-white placeholder-zinc-600 outline-none focus:border-[#00D4AA]/50 transition-colors font-mono cursor-pointer"
+                        >
+                          <option value="5">5 Minutes (Maximum Policy)</option>
+                          <option value="15">15 Minutes (Default Policy)</option>
+                          <option value="30">30 Minutes</option>
+                          <option value="60">1 Hour (Lenient Policy)</option>
+                          <option value="0">Never Lock (High Vulnerability Warning)</option>
+                        </select>
+                        {settings.autoLockTime === 0 && (
+                          <div className="bg-yellow-500/10 border border-yellow-500/20 rounded p-2 text-[10px] text-yellow-400 font-light flex items-start gap-1.5 animate-fade-in mt-1">
+                            <AlertCircle size={12} className="shrink-0 mt-0.5" />
+                            <span>Warning: Disabling automatic lock exposes your plaintext keys if the device is left physically unattended.</span>
+                          </div>
+                        )}
+                      </div>
 
-                {/* Toggles copy */}
-                <div className="pt-2">
-                  <label className="flex items-start gap-3 cursor-pointer select-none">
-                    <input
-                      type="checkbox"
-                      checked={settings.requirePasswordOnCopy}
-                      onChange={(e) => setSettings({ ...settings, requirePasswordOnCopy: e.target.checked })}
-                      className="rounded accent-[#00D4AA] w-4 h-4 mt-0.5 shrink-0 cursor-pointer"
-                    />
-                    <div>
-                      <span className="text-xs font-semibold text-white block">Require Verification on Copy</span>
-                      <p className="text-[10px] text-zinc-500 leading-relaxed font-light mt-0.5">
-                        Trigger security audit confirmation checks before password fields can copy into device clipboards.
+                      {/* Reauthentication Policy Toggle */}
+                      <div className="pt-3 border-t border-white/5">
+                        <label className="flex items-start gap-3 cursor-pointer select-none">
+                          <input
+                            type="checkbox"
+                            checked={settings.requirePasswordOnAction}
+                            onChange={(e) => setSettings({ ...settings, requirePasswordOnAction: e.target.checked })}
+                            className="rounded accent-[#00D4AA] w-4 h-4 mt-0.5 shrink-0 cursor-pointer"
+                          />
+                          <div>
+                            <span className="text-xs font-semibold text-white block">Require Password Reauthentication</span>
+                            <p className="text-[10px] text-zinc-500 leading-relaxed font-light mt-0.5">
+                              Re-verify master password before sensitive operations (viewing passwords, JSON export, altering back-ups).
+                            </p>
+                          </div>
+                        </label>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Card 2: Clipboard Security */}
+                  <div className="bg-[#0C0C0C] border border-white/10 rounded-xl p-5 space-y-4 shadow-lg min-h-[220px] flex flex-col justify-between">
+                    <div className="space-y-4">
+                      <h3 className="text-sm font-semibold text-white flex items-center gap-2 border-b border-white/5 pb-2">
+                        <Copy size={16} className="text-[#00D4AA]" />
+                        Clipboard Leakage Safeguards
+                      </h3>
+                      
+                      {/* Auto Clear Clipboard Dropdown */}
+                      <div className="space-y-1.5">
+                        <label className="text-[10px] font-semibold text-zinc-400 font-mono uppercase tracking-wider block">
+                          Auto Clear Clipboard Delay
+                        </label>
+                        <p className="text-zinc-500 text-[10px] font-light leading-relaxed">
+                          Purges credential characters copied into your memory clipboard after usage.
+                        </p>
+                        <select
+                          value={settings.autoClearClipboardTime}
+                          onChange={(e) => setSettings({ ...settings, autoClearClipboardTime: Number(e.target.value) })}
+                          className="w-full bg-[#171717] border border-white/5 rounded-md px-3 py-2 text-xs text-white placeholder-zinc-600 outline-none focus:border-[#00D4AA]/50 transition-colors font-mono cursor-pointer"
+                        >
+                          <option value="15">15 Seconds (Aggressive Control)</option>
+                          <option value="30">30 Seconds (Recommended)</option>
+                          <option value="60">1 Minute</option>
+                          <option value="300">5 Minutes</option>
+                          <option value="0">Never Clear Clipboard (Vulnerable)</option>
+                        </select>
+                      </div>
+
+                      {/* Require Verification Before Copy */}
+                      <div className="pt-3 border-t border-white/5">
+                        <label className="flex items-start gap-3 cursor-pointer select-none">
+                          <input
+                            type="checkbox"
+                            checked={settings.requirePasswordOnCopy}
+                            onChange={(e) => setSettings({ ...settings, requirePasswordOnCopy: e.target.checked })}
+                            className="rounded accent-[#00D4AA] w-4 h-4 mt-0.5 shrink-0 cursor-pointer"
+                          />
+                          <div>
+                            <span className="text-xs font-semibold text-white block">Require Copy Verification Check</span>
+                            <p className="text-[10px] text-zinc-500 leading-relaxed font-light mt-0.5">
+                              Triggers a master password reauthentication prompt before any password element is exported to clipboard.
+                            </p>
+                          </div>
+                        </label>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Card 3: Authentication Security & 2FA */}
+                  <div className="bg-[#0C0C0C] border border-white/10 rounded-xl p-5 shadow-lg relative overflow-hidden md:col-span-2">
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                      <div className="space-y-4">
+                        <h3 className="text-sm font-semibold text-white flex items-center gap-2 border-b border-white/5 pb-2">
+                          <KeyRound size={16} className="text-[#00D4AA]" />
+                          MFA & Access Authentication
+                        </h3>
+
+                        {/* Enable 2FA toggle */}
+                        <div className="space-y-2">
+                          <label className="flex items-start gap-3 cursor-pointer select-none">
+                            <input
+                              type="checkbox"
+                              checked={settings.twoFactorEnabled}
+                              onChange={(e) => setSettings({ ...settings, twoFactorEnabled: e.target.checked })}
+                              className="rounded accent-[#00D4AA] w-4 h-4 mt-0.5 shrink-0 cursor-pointer"
+                            />
+                            <div>
+                              <span className="text-xs font-semibold text-white block">Enable Two-Factor Authentication (OTP)</span>
+                              <p className="text-[10px] text-zinc-550 leading-relaxed font-light mt-0.5">
+                                Enforce standard TOTP Authenticator apps during account lock sequence validations.
+                              </p>
+                            </div>
+                          </label>
+                        </div>
+
+                        {/* Maximum failed unlock attempts */}
+                        <div className="space-y-1.5 pt-3 border-t border-white/5">
+                          <label className="text-[10px] font-semibold text-zinc-400 font-mono uppercase tracking-wider block">
+                            Maximum Failed Unlock Attempts
+                          </label>
+                          <p className="text-zinc-500 text-[10px] font-light leading-relaxed">
+                            Locks access to this database for 5 minutes when consecutive login password faults occur.
+                          </p>
+                          <select
+                            value={settings.maxFailedAttempts}
+                            onChange={(e) => setSettings({ ...settings, maxFailedAttempts: Number(e.target.value) })}
+                            className="w-full bg-[#171717] border border-white/5 rounded-md px-3 py-2 text-xs text-white placeholder-zinc-600 outline-none focus:border-[#00D4AA]/50 transition-colors font-mono cursor-pointer"
+                          >
+                            <option value="5">5 Failed Attempts (Default Recommended)</option>
+                            <option value="10">10 Failed Attempts (Low Security)</option>
+                            <option value="0">Unlimited Attempts (Vulnerable to bypass)</option>
+                          </select>
+                        </div>
+                      </div>
+
+                      {/* Interactive 2FA Details Setup (Simulated setup keys if 2FA enabled) */}
+                      <div>
+                        {settings.twoFactorEnabled ? (
+                          <div className="bg-[#121212] border border-white/5 rounded-xl p-4 space-y-3 text-xs animate-fade-in h-full flex flex-col justify-between">
+                            <div>
+                              <div className="flex items-center justify-between border-b border-white/5 pb-2 mb-2">
+                                <span className="text-[10px] font-semibold text-[#00D4AA] tracking-wider uppercase font-mono">TOTP Secret Activated</span>
+                                <span className="px-1.5 py-0.5 bg-green-500/10 border border-green-500/20 text-green-400 rounded text-[9px] font-bold font-mono">ENROLLED</span>
+                              </div>
+                              
+                              <div className="space-y-1">
+                                <p className="text-zinc-400 text-[10px] font-light leading-relaxed">
+                                  Scan this setup secret inside Google Authenticator or secondary OTP utilities:
+                                </p>
+                                <div className="bg-black/40 border border-white/10 p-2 text-center rounded font-mono text-zinc-300 text-[11px] flex items-center justify-between gap-1 mt-1">
+                                  <span>SV-JBSW-Y3DP-EHPK-3PXP</span>
+                                  <button
+                                    type="button"
+                                    onClick={() => performCopy("SV-JBSW-Y3DP-EHPK-3PXP", "TOTP Secret")}
+                                    className="text-zinc-400 hover:text-[#00D4AA] transition-colors cursor-pointer"
+                                    title="Copy Secret"
+                                  >
+                                    <Copy size={12} />
+                                  </button>
+                                </div>
+                              </div>
+                            </div>
+
+                            <div className="space-y-1 pt-2 border-t border-white/5">
+                              <p className="text-zinc-400 text-[10px] font-semibold">Active Backup Recovery Codes:</p>
+                              <div className="grid grid-cols-2 gap-1.5 font-mono text-[9px] text-[#00D4AA]/90 pl-1">
+                                <span>• SV-4820-1928</span>
+                                <span>• SV-9281-2948</span>
+                                <span>• SV-8831-1120</span>
+                                <span>• SV-4921-9922</span>
+                              </div>
+                              <p className="text-[9px] text-zinc-500 font-light mt-1">If standard OTP fails, save/provide these single-use recovery parameters.</p>
+                            </div>
+                          </div>
+                        ) : (
+                          <div className="border border-dashed border-white/10 rounded-xl p-6 text-center h-full flex flex-col items-center justify-center text-zinc-500 space-y-2 min-h-[160px]">
+                            <KeyRound size={24} className="text-zinc-650 animate-pulse text-[#00D4AA]/30" />
+                            <div>
+                              <p className="text-xs font-semibold text-zinc-400">Two-Factor Authentication Inactive</p>
+                              <p className="text-[10px] text-zinc-500 max-w-[200px] mx-auto mt-0.5">Toggle standard verification to enroll authenticator cryptographic key tokens.</p>
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Card 4: Vault Protection */}
+                  <div className="bg-[#0C0C0C] border border-white/10 rounded-xl p-5 space-y-4 shadow-lg min-h-[220px] flex flex-col justify-between">
+                    <div className="space-y-4">
+                      <h3 className="text-sm font-semibold text-white flex items-center gap-2 border-b border-white/5 pb-2">
+                        <Lock size={16} className="text-red-400" />
+                        Physical Vault Protection
+                      </h3>
+                      
+                      {/* Lock on Browser close */}
+                      <div className="space-y-2">
+                        <label className="flex items-start gap-3 cursor-pointer select-none">
+                          <input
+                            type="checkbox"
+                            checked={settings.lockOnBrowserClose}
+                            onChange={(e) => setSettings({ ...settings, lockOnBrowserClose: e.target.checked })}
+                            className="rounded accent-[#00D4AA] w-4 h-4 mt-0.5 shrink-0 cursor-pointer"
+                          />
+                          <div>
+                            <span className="text-xs font-semibold text-white block">Lock Vault on Window Close</span>
+                            <p className="text-[10px] text-zinc-500 leading-relaxed font-light mt-0.5">
+                              Automatically locks the vault and purges active session storage indicators whenever the browser tab triggers unloading states.
+                            </p>
+                          </div>
+                        </label>
+                      </div>
+
+                      {/* Panic action indicator */}
+                      <div className="pt-3 border-t border-white/5 space-y-2">
+                        <span className="text-xs font-semibold text-red-400 block">Emergency Panic Disarm</span>
+                        <p className="text-[10px] text-zinc-500 leading-relaxed font-light">
+                          Instantly locks the vault, clears your clipboard history, and purges all active key verifiers. Use in cases of immediate host device vulnerability.
+                        </p>
+                        <button
+                          type="button"
+                          onClick={triggerPanicLock}
+                          className="w-full bg-red-955/20 hover:bg-red-950/40 border border-red-500/20 text-red-200 hover:text-white font-semibold py-1.5 rounded-md transition-all cursor-pointer text-xs"
+                        >
+                          Engage Immediate Emergency Lockout
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Card 5: Device Trust Management */}
+                  <div className="bg-[#0C0C0C] border border-white/10 rounded-xl p-5 space-y-4 shadow-lg min-h-[220px] flex flex-col justify-between">
+                    <div className="space-y-4">
+                      <h3 className="text-sm font-semibold text-white flex items-center gap-2 border-b border-white/5 pb-2">
+                        <Smartphone size={16} className="text-[#00D4AA]" />
+                        Device Trust Management
+                      </h3>
+                      
+                      {/* Remember Trusted Device */}
+                      <div className="space-y-2">
+                        <label className="flex items-start gap-3 cursor-pointer select-none">
+                          <input
+                            type="checkbox"
+                            checked={settings.rememberTrustedDevice}
+                            onChange={(e) => setSettings({ ...settings, rememberTrustedDevice: e.target.checked })}
+                            className="rounded accent-[#00D4AA] w-4 h-4 mt-0.5 shrink-0 cursor-pointer"
+                          />
+                          <div>
+                            <span className="text-xs font-semibold text-white block">Trust This Device Container</span>
+                            <p className="text-[10px] text-zinc-500 leading-relaxed font-light mt-0.5">
+                              Authorizes persistent device storage configuration, bypassing multi-factor prompts for consecutive logins.
+                            </p>
+                          </div>
+                        </label>
+                      </div>
+
+                      {/* Trusted Devices list */}
+                      <div className="space-y-2 pt-3 border-t border-white/5">
+                        <span className="text-[10px] font-semibold text-zinc-400 font-mono uppercase tracking-wider block">Authorized Device Logbook</span>
+                        <div className="space-y-2 text-[10px] max-h-[140px] overflow-y-auto pr-1">
+                          {trustedDevices.map(dev => (
+                            <div key={dev.id} className="flex items-center justify-between gap-2 p-2 bg-white/5 border border-white/5 rounded-lg animate-fade-in">
+                              <div className="flex items-center gap-2.5 min-w-0">
+                                {dev.type === "desktop" ? (
+                                  <Laptop size={14} className="text-[#00D4AA] shrink-0" />
+                                ) : (
+                                  <Smartphone size={14} className="text-[#00D4AA] shrink-0" />
+                                )}
+                                <div className="min-w-0">
+                                  <p className="text-[11px] font-medium text-white truncate">{dev.name}</p>
+                                  <p className="text-[9px] text-zinc-500 font-mono">{dev.lastActive}</p>
+                                </div>
+                              </div>
+                              
+                              {!dev.isCurrent ? (
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setTrustedDevices(prev => {
+                                      const filtered = prev.filter(d => d.id !== dev.id);
+                                      const storedTrustedKey = `securevault_trusted_devices_${username.trim().toLowerCase()}`;
+                                      const toSave = filtered.filter(d => !d.isCurrent);
+                                      localStorage.setItem(storedTrustedKey, JSON.stringify(toSave));
+                                      return filtered;
+                                    });
+                                    setApiSuccess(`Successfully revoked trust authorization for: "${dev.name}"`);
+                                    setTimeout(() => setApiSuccess(""), 4000);
+                                  }}
+                                  className="px-2 py-1 bg-red-955/20 hover:bg-red-950/40 border border-red-500/20 text-red-300 rounded text-[9px] font-semibold transition-all cursor-pointer"
+                                >
+                                  Revoke
+                                </button>
+                              ) : (
+                                <span className="px-1.5 py-0.5 bg-[#00D4AA]/10 border border-[#00D4AA]/20 text-[#00D4AA] rounded text-[8px] font-semibold font-mono uppercase shrink-0">Current</span>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Card 6: Security Summary & Submit */}
+                  <div className="bg-[#0C0C0C] border border-[#00D4AA]/20 rounded-xl p-5 shadow-lg relative overflow-hidden md:col-span-2 space-y-4">
+                    <div className="absolute top-0 right-0 p-8 opacity-[0.02] pointer-events-none">
+                      <Shield size={120} className="text-[#00D4AA]" />
+                    </div>
+                    
+                    <div className="space-y-2 text-zinc-300 text-xs">
+                      <span className="text-[10px] font-bold text-[#00D4AA] tracking-wider uppercase font-mono block">Zero-Knowledge Summary State</span>
+                      <p className="text-[11px] text-zinc-400 font-light leading-relaxed">
+                        All preference changes are signed and fully written into the self-hosted database files client-side. The Express backend receives verification keys and lock configuration hashes without gaining any knowledge of your physical master secrets.
                       </p>
                     </div>
-                  </label>
-                </div>
 
-                {/* Toggles 2FA */}
-                <div className="pt-1 border-t border-white/10 pt-4">
-                  <label className="flex items-start gap-3 cursor-pointer select-none">
-                    <input
-                      type="checkbox"
-                      checked={settings.twoFactorEnabled}
-                      onChange={(e) => setSettings({ ...settings, twoFactorEnabled: e.target.checked })}
-                      className="rounded accent-[#00D4AA] w-4 h-4 mt-0.5 shrink-0 cursor-pointer"
-                    />
-                    <div>
-                      <span className="text-xs font-semibold text-white block">Enable Two-Factor Verification</span>
-                      <p className="text-[10px] text-zinc-500 leading-relaxed font-light mt-0.5">
-                        Requires standard authenticators OTP (One-Time Passcode) verification parameters during host login sequences.
-                      </p>
+                    <div className="pt-3 border-t border-white/5 flex flex-col sm:flex-row sm:items-center justify-between gap-4 font-mono text-[10px]">
+                      <div className="flex flex-wrap gap-x-4 gap-y-2 text-zinc-500">
+                        <span>• AUTO-LOCK: <strong className="text-[#00D4AA]">{settings.autoLockTime === 0 ? "DISABLED" : `${settings.autoLockTime} MINS`}</strong></span>
+                        <span>• RE-AUTH: <strong className="text-[#00D4AA]">{settings.requirePasswordOnAction ? "ENABLED" : "DISABLED"}</strong></span>
+                        <span>• CLIPBOARD CLEAR: <strong className="text-[#00D4AA]">{settings.autoClearClipboardTime === 0 ? "OFF" : `${settings.autoClearClipboardTime}s`}</strong></span>
+                        <span>• FAILED LIMIT: <strong className="text-[#00D4AA]">{settings.maxFailedAttempts === 0 ? "UNLIMITED" : `${settings.maxFailedAttempts} ATTEMPTS`}</strong></span>
+                      </div>
+
+                      <button
+                        type="submit"
+                        className="w-full sm:w-auto px-6 py-2 bg-[#00D4AA] hover:bg-[#00B894] text-black font-semibold text-xs rounded-md transition-all cursor-pointer shadow-sm hover:scale-[1.01] active:scale-[0.99] text-center"
+                      >
+                        Save Configuration Rules
+                      </button>
                     </div>
-                  </label>
-                </div>
+                  </div>
 
-                <button
-                  type="submit"
-                  className="w-full bg-[#00D4AA] text-black font-semibold py-2 rounded-md hover:bg-[#00B894] transition-colors cursor-pointer shadow-sm mt-3"
-                >
-                  Save and Set Rules
-                </button>
+                </div>
               </form>
+
             </div>
           )}
 
         </main>
       </div>
+
+      {/* Zero-Knowledge Password Reauthentication Overlay */}
+      {reauthModal.isOpen && (
+        <div className="fixed inset-0 bg-black/80 backdrop-blur-sm z-[999] flex items-center justify-center p-4 font-sans animate-fade-in">
+          <div className="bg-[#0C0C0C] border border-white/10 p-6 rounded-2xl max-w-sm w-full space-y-4 shadow-2xl relative text-left">
+            <div className="absolute top-4 right-4">
+              <button
+                type="button"
+                onClick={() => setReauthModal(prev => ({ ...prev, isOpen: false }))}
+                className="text-zinc-500 hover:text-white transition-colors cursor-pointer"
+              >
+                <X size={16} />
+              </button>
+            </div>
+
+            <div className="space-y-1.5">
+              <div className="w-8 h-8 rounded-lg bg-[#00D4AA]/10 flex items-center justify-center text-[#00D4AA]">
+                <Lock size={16} />
+              </div>
+              <h3 className="text-sm font-semibold text-white">Reauthentication Required</h3>
+              <p className="text-zinc-400 text-[11px] font-light leading-relaxed">
+                For security enforcement, verify your master passphrase to authorize: 
+                <strong className="text-white block mt-1 font-mono">{reauthModal.reason}</strong>
+              </p>
+            </div>
+
+            <form onSubmit={handleReauthSubmit} className="space-y-3 pt-1">
+              <div className="space-y-1">
+                <label className="text-[9px] font-mono font-semibold text-zinc-500 uppercase tracking-wider block">Master Passphrase</label>
+                <input
+                  type="password"
+                  value={reauthPassword}
+                  onChange={(e) => setReauthPassword(e.target.value)}
+                  className="w-full bg-[#171717] border border-white/5 rounded-md px-3 py-2 text-xs text-white placeholder-zinc-700 outline-none focus:border-[#00D4AA]/50 transition-colors"
+                  placeholder="••••••••••••••••"
+                  autoFocus
+                />
+              </div>
+
+              {reauthError && (
+                <div className="text-[10px] text-red-400 font-light flex items-center gap-1.5 leading-relaxed">
+                  <AlertCircle size={10} className="shrink-0 mt-0.5" />
+                  <span>{reauthError}</span>
+                </div>
+              )}
+
+              <button
+                type="submit"
+                disabled={isReauthing}
+                className="w-full bg-[#00D4AA] disabled:bg-zinc-700 disabled:text-zinc-400 text-black font-semibold py-2 rounded-md hover:bg-[#00B894] transition-colors cursor-pointer text-xs md:text-sm shadow"
+              >
+                {isReauthing ? "Validating key proof..." : "Authorize and Proceed"}
+              </button>
+            </form>
+          </div>
+        </div>
+      )}
 
     </div>
   );

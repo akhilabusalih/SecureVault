@@ -68,6 +68,11 @@ export interface ActivityLogItem {
 
 export interface UserSettings {
   autoLockTime: number; // in minutes
-  requirePasswordOnCopy: boolean;
+  requirePasswordOnCopy: boolean; // maps to requireVerificationOnCopy
   twoFactorEnabled: boolean;
+  requirePasswordOnAction: boolean;
+  autoClearClipboardTime: number; // in seconds
+  maxFailedAttempts: number; // 5, 10, or 0 (unlimited)
+  lockOnBrowserClose: boolean;
+  rememberTrustedDevice: boolean;
 }
